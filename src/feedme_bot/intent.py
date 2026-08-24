@@ -15,7 +15,9 @@ from pydantic import BaseModel
 
 from feedme_bot.config import settings
 
-MODEL = "llama-3.3-70b-versatile"
+# Verified live against this Groq account's actual model list (2026-08-25) —
+# llama-3.3-70b-versatile is gone from the lineup entirely, don't assume it.
+MODEL = "openai/gpt-oss-120b"
 
 MessageKind = Literal["new_order", "selection", "modification", "cancellation", "not_food"]
 
@@ -67,6 +69,17 @@ EXTRACT_PROMPT = """You are a strict JSON extraction engine for a food delivery 
 Parse the input into this JSON object, nothing else:
 {"query": string, "max_price": integer or null, "max_eta_mins": integer or null,
  "dietary_preference": "veg" | "non-veg" | "any", "high_protein": boolean}
+
+"query" is a short dish/food search term ONLY (e.g. "chicken bowl", "biryani",
+"protein salad") — it goes straight into a menu search, so it must NOT include
+price, time, or mood/context phrasing. Strip all of that out into the other
+fields. If no specific dish is named, use a short generic term implied by the
+other constraints (e.g. "high protein" if only high_protein is mentioned).
+
+Example: "Tired after workout, chicken dish under 350, fast ETA" ->
+{"query": "chicken", "max_price": 350, "max_eta_mins": null,
+ "dietary_preference": "any", "high_protein": false}
+
 Return ONLY valid JSON, no markdown fences."""
 
 

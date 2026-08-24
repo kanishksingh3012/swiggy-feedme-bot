@@ -74,6 +74,23 @@ async def search_menu(
     return result.get("data", result)
 
 
+async def update_food_cart(
+    address_id: str, restaurant_id: str, menu_item_id: str, quantity: int = 1
+) -> dict[str, Any]:
+    args = {
+        "addressId": address_id,
+        "restaurantId": restaurant_id,
+        "cartItems": [{"menu_item_id": menu_item_id, "quantity": quantity}],
+    }
+    result = await _call_tool("update_food_cart", args)
+    return result.get("data", result)
+
+
+async def get_food_cart(address_id: str) -> dict[str, Any]:
+    result = await _call_tool("get_food_cart", {"addressId": address_id})
+    return result.get("data", result)
+
+
 async def place_food_order(
     address_id: str,
     payment_method: str,  # "Cash" or "UPI" — never "COD"/"PayWithQR", per verified findings
@@ -83,3 +100,26 @@ async def place_food_order(
     if payment_method == "UPI" and generate_upi_qr:
         args["generateUPIQR"] = True
     return await _call_tool("place_food_order", args)
+
+
+async def check_payment_status(paas_id: str, **extra: Any) -> dict[str, Any]:
+    # extra: orderId/addressId/cartId/lat/lng, whichever place_food_order handed back —
+    # optional, but pass through whatever's available for auto-confirm on Swiggy's side.
+    args = {"paasId": paas_id, **{k: v for k, v in extra.items() if v is not None}}
+    result = await _call_tool("check_payment_status", args)
+    return result.get("data", result)
+
+
+async def confirm_order(
+    order_id: str, address_id: str, lat: float, lng: float, cart_id: str | None = None
+) -> dict[str, Any]:
+    args: dict[str, Any] = {
+        "orderId": order_id,
+        "addressId": address_id,
+        "lat": lat,
+        "lng": lng,
+    }
+    if cart_id:
+        args["cartId"] = cart_id
+    result = await _call_tool("confirm_order", args)
+    return result.get("data", result)

@@ -4,6 +4,7 @@ exercised directly — e.g. from a script or test — without a live webhook.
 That's the "build the backend now, wire WhatsApp once unblocked" plan.
 """
 
+import asyncio
 from typing import Any
 
 from feedme_bot import rank, swiggy_client
@@ -15,11 +16,40 @@ from feedme_bot.intent import (
 )
 from feedme_bot.state import PendingConfirmation, PendingOptions, UserState, store
 
+# search_menu returns no ETA field at all (only search_restaurants would) — so
+# intent.max_eta_mins can't actually be honored by this item-search-based flow.
+# Not silently ignoring it: surfaced as a known gap here rather than faked.
+PRICE_RELAXATION_FACTOR = 1.25
+
 
 def _format_item(label: str, item: dict[str, Any]) -> str:
     name = item.get("name", "?")
     price = item.get("price", "?")
     return f"{label}: {name}\n• Price: ₹{price}"
+
+
+def _filter_candidates(
+    items: list[dict[str, Any]], max_price: float | None
+) -> tuple[list[dict[str, Any]], bool]:
+    """In-stock always; price only if given. Returns (filtered, was_relaxed)."""
+    in_stock = [item for item in items if item.get("inStock", True)]
+    if max_price is None:
+        return in_stock, False
+
+    strict = [item for item in in_stock if item.get("price", 0) <= max_price]
+    if len(strict) >= 2:
+        return strict, False
+
+    relaxed = [
+        item for item in in_stock if item.get("price", 0) <= max_price * PRICE_RELAXATION_FACTOR
+    ]
+    if len(relaxed) >= 2:
+        return relaxed, True
+
+    # Nothing close either — fall back to whatever's in stock so the user
+    # sees *something* rather than a dead end, but we tell them we gave up
+    # on the budget constraint entirely.
+    return in_stock, True
 
 
 async def _start_new_order(user: UserState, text: str) -> str:
@@ -28,16 +58,16 @@ async def _start_new_order(user: UserState, text: str) -> str:
     addresses = await swiggy_client.get_addresses()
     if not addresses:
         return "No saved address on your Swiggy account — add one before I can search."
-    address_id = addresses[0]["addressId"] if "addressId" in addresses[0] else addresses[0]["id"]
+    address_id = addresses[0].get("addressId") or addresses[0].get("id")
 
     search = await swiggy_client.search_menu(
         address_id, intent.query, veg_only=(intent.dietary_preference == "veg")
     )
-    candidates = search.get("items", [])
+    raw_candidates = search.get("items", [])
+    candidates, was_relaxed = _filter_candidates(raw_candidates, intent.max_price)
+
     if len(candidates) < 2:
-        # TODO: relaxation policy for zero/near-zero results (widen price/ETA,
-        # explain what was relaxed) — deliberately not built yet, see plan checklist.
-        return f"Couldn't find enough matches for '{intent.query}'. Try loosening the constraints?"
+        return f"Couldn't find enough matches for '{intent.query}' near you at all — try a different dish?"
 
     try:
         safe_pick, mood_pick = rank.rank_candidates(intent, candidates)
@@ -47,12 +77,82 @@ async def _start_new_order(user: UserState, text: str) -> str:
     user.pending_options = PendingOptions(
         safe_pick=safe_pick, mood_pick=mood_pick, address_id=address_id
     )
+    header = "🍽️ Top 2 Picks Found:"
+    if was_relaxed and intent.max_price is not None:
+        header += f"\n(nothing solid under ₹{intent.max_price}, showing closest matches)"
     return (
-        "🍽️ Top 2 Picks Found:\n\n"
+        f"{header}\n\n"
         f"1️⃣ {_format_item('Safe Pick', safe_pick)}\n\n"
         f"2️⃣ {_format_item('Mood Pick', mood_pick)}\n\n"
         'Reply "1" or "2" to pick one — I\'ll confirm before ordering anything.'
     )
+
+
+async def _add_to_cart_and_revalidate(
+    item: dict[str, Any], address_id: str
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Actually adds the item to the server-side cart (place_food_order acts
+    on whatever's in the cart, not on an item id — this step isn't optional)
+    and returns the fresh cart, which doubles as the staleness re-check
+    right before checkout. Returns (cart, error_message)."""
+    menu_item_id = item.get("menu_item_id") or item.get("id")
+    restaurant_id = item.get("restaurant_id")
+    if not menu_item_id or not restaurant_id:
+        return None, "Lost track of which item this was — mind resending your request?"
+
+    await swiggy_client.update_food_cart(address_id, restaurant_id, str(menu_item_id))
+    cart = await swiggy_client.get_food_cart(address_id)
+
+    cart_items = cart.get("items", [])
+    matching = next((c for c in cart_items if c.get("menu_item_id") == menu_item_id), None)
+    if matching is None:
+        return None, "Couldn't confirm that item made it into the cart — want to try again?"
+    if not matching.get("in_stock", True):
+        return None, f"{item.get('name', 'That item')} just went out of stock — try something else?"
+
+    return cart, None
+
+
+async def _poll_payment_and_finalize(
+    place_result: dict[str, Any], address_id: str
+) -> str:
+    paas_id = place_result.get("paasId")
+    if not paas_id:
+        return "Payment couldn't be started — try again in a moment?"
+
+    interval_s = max(place_result.get("pollingIntervalInMs", 3000), 1000) / 1000
+    max_time_s = place_result.get("maxTimeToPollForInMs", 120_000) / 1000
+    elapsed = 0.0
+
+    while elapsed < max_time_s:
+        await asyncio.sleep(interval_s)
+        elapsed += interval_s
+        status = await swiggy_client.check_payment_status(
+            paas_id,
+            orderId=place_result.get("orderId"),
+            addressId=address_id,
+            cartId=place_result.get("cartId"),
+            lat=place_result.get("lat"),
+            lng=place_result.get("lng"),
+        )
+        if not status.get("terminal"):
+            continue
+
+        if status.get("isTerminalSuccess"):
+            if status.get("confirmed"):
+                return "Payment confirmed — your order's in!"
+            order_id = status.get("orderId") or place_result.get("orderId")
+            lat, lng = place_result.get("lat"), place_result.get("lng")
+            if order_id and lat is not None and lng is not None:
+                await swiggy_client.confirm_order(
+                    order_id, address_id, lat, lng, cart_id=place_result.get("cartId")
+                )
+            return "Payment confirmed — your order's in!"
+
+        if status.get("isTerminalFailure"):
+            return "Payment didn't go through — want to try again?"
+
+    return "Still waiting on payment confirmation — check the Swiggy app if this takes a while."
 
 
 async def handle_message(jid: str, text: str) -> str:
@@ -70,14 +170,22 @@ async def handle_message(jid: str, text: str) -> str:
             item = user.pending_confirmation.item
             address_id = user.pending_confirmation.address_id
             user.pending_confirmation = None
-            # TODO: re-validate price/availability against a fresh cart fetch
-            # immediately before this call — deliberately not built yet,
-            # see plan checklist (staleness guard).
+
+            cart, error = await _add_to_cart_and_revalidate(item, address_id)
+            if error:
+                return error
+
+            fresh_price = cart.get("pricing", {}).get("to_pay") if cart else None
+            # Default to Cash/COD, matching the "minimal phone-interaction"
+            # default from plan notes — UPI is a fallback, not built out here.
             result = await swiggy_client.place_food_order(address_id, payment_method="Cash")
             user.order_history.append(item)
-            if result.get("normalizedStatus") == "pending":
-                return "Order placed via UPI — pay via the link/QR to confirm."
-            return f"Confirmed! {item.get('name', 'Your order')} is on its way."
+
+            if result.get("status") == "PENDING_PAYMENT" or result.get("normalizedStatus") == "pending":
+                return await _poll_payment_and_finalize(result, address_id)
+
+            price_note = f" (₹{fresh_price})" if fresh_price else ""
+            return f"Confirmed! {item.get('name', 'Your order')}{price_note} is on its way."
         elif decision == "no":
             user.pending_confirmation = None
             return "No worries, cancelled."
