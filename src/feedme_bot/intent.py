@@ -70,14 +70,32 @@ Parse the input into this JSON object, nothing else:
 {"query": string, "max_price": integer or null, "max_eta_mins": integer or null,
  "dietary_preference": "veg" | "non-veg" | "any", "high_protein": boolean}
 
-"query" is a short dish/food search term ONLY (e.g. "chicken bowl", "biryani",
-"protein salad") — it goes straight into a menu search, so it must NOT include
-price, time, or mood/context phrasing. Strip all of that out into the other
-fields. If no specific dish is named, use a short generic term implied by the
-other constraints (e.g. "high protein" if only high_protein is mentioned).
+"query" goes straight into a keyword search against real menu item names, so
+it must be a concrete, searchable food/dish/cuisine term — never price, time,
+or mood/context phrasing on its own.
 
-Example: "Tired after workout, chicken dish under 350, fast ETA" ->
+Most real messages do NOT name a dish directly — they describe a mood, craving,
+or context instead ("something warm and comforting", "craving something spicy",
+"feeling like junk food today", "light and healthy, not too heavy"). Your main
+job is translating that into a concrete term a food delivery app would actually
+have menu items for, using ordinary judgment about what that mood usually means
+as food (comforting/rainy-day -> soup, khichdi, maggi, dal rice; spicy craving ->
+biryani, chilli chicken; junk food mood -> burger, pizza, fries; light/healthy ->
+salad, grilled chicken, poke). Don't default to a vague word like "food" or the
+mood word itself ("comforting") — always resolve to something a menu search
+would actually match.
+
+Examples:
+"Tired after workout, chicken dish under 350, fast ETA" ->
 {"query": "chicken", "max_price": 350, "max_eta_mins": null,
+ "dietary_preference": "any", "high_protein": false}
+
+"I'm just in the mood for something warm and comforting, keep it under 250" ->
+{"query": "khichdi", "max_price": 250, "max_eta_mins": null,
+ "dietary_preference": "any", "high_protein": false}
+
+"honestly just craving something greasy and unhealthy rn" ->
+{"query": "burger", "max_price": null, "max_eta_mins": null,
  "dietary_preference": "any", "high_protein": false}
 
 Return ONLY valid JSON, no markdown fences."""
