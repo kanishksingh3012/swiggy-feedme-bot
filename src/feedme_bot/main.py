@@ -52,6 +52,12 @@ async def receive_webhook(request: Request) -> dict[str, str]:
             continue  # voice notes / other types handled separately, not wired up yet
 
         reply = await handle_message(from_number, text)
-        await whatsapp.send_text(from_number, reply)
+        try:
+            await whatsapp.send_text(from_number, reply)
+        except Exception:
+            # A failed outbound send (e.g. an invalid/unreachable recipient)
+            # shouldn't crash the webhook handler — log it and move on. Meta
+            # expects a fast 200 regardless, or it'll start retrying delivery.
+            logger.exception("Failed to send WhatsApp reply to %s", from_number)
 
     return {"status": "ok"}
