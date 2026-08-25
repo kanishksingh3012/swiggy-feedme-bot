@@ -12,6 +12,7 @@ Only wrapping the tools actually verified against live per-tool docs
 not before.
 """
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -25,7 +26,11 @@ class SwiggyToolError(Exception):
 
 
 async def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    token = load_token()
+    # load_token()/login() are blocking (opens a browser, waits on a local
+    # HTTP callback for up to 5 minutes) — running it in a thread instead of
+    # awaiting it directly keeps the event loop free to handle other
+    # requests in the meantime, rather than freezing the whole server.
+    token = await asyncio.to_thread(load_token)
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json, text/event-stream",
@@ -47,7 +52,7 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         # No refresh grant exists — force a fresh interactive login and retry once.
         from feedme_bot.swiggy_auth import login
 
-        login()
+        await asyncio.to_thread(login)
         return await _call_tool(name, arguments)
 
     response.raise_for_status()

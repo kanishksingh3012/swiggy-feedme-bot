@@ -5,6 +5,12 @@ phone+OTP consent -> /auth/token exchange. Access tokens last 5 days
 (expires_in=432000) and there is NO refresh_token — don't build a
 refresh-grant path, the only recovery from a 401 is re-running this full
 flow.
+
+/auth/authorize requires a client_id, which the docs don't spell out —
+confirmed live that Dynamic Client Registration (POST /auth/register,
+RFC 7591) returns one (client_id "swiggy-mcp" for a public/PKCE client,
+no secret). Registering fresh on every login rather than caching it —
+the call is fast and idempotent, not worth the extra persisted state.
 """
 
 import base64
@@ -71,14 +77,31 @@ def _wait_for_auth_code(timeout_seconds: int = 300) -> str:
         server.shutdown()
 
 
+def _register_client(redirect_uri: str) -> str:
+    response = httpx.post(
+        f"{settings.swiggy_mcp_base_url}/auth/register",
+        json={
+            "redirect_uris": [redirect_uri],
+            "client_name": "FeedMe Bot",
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+        },
+    )
+    response.raise_for_status()
+    return response.json()["client_id"]
+
+
 def login() -> dict[str, Any]:
     """Run the full interactive PKCE flow and persist the resulting token."""
     verifier, challenge = _pkce_pair()
     redirect_uri = f"http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}"
+    client_id = _register_client(redirect_uri)
 
     authorize_url = f"{settings.swiggy_mcp_base_url}/auth/authorize?" + urllib.parse.urlencode(
         {
             "response_type": "code",
+            "client_id": client_id,
             "redirect_uri": redirect_uri,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
@@ -94,6 +117,7 @@ def login() -> dict[str, Any]:
             "code": code,
             "redirect_uri": redirect_uri,
             "code_verifier": verifier,
+            "client_id": client_id,
         },
     )
     response.raise_for_status()
