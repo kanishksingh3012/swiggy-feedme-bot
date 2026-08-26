@@ -6,10 +6,11 @@ server 406s. Domain/business errors surface as `isError: true` inside a
 200 response, not as an HTTP error or a JSON-RPC `error` object — check
 isError on every call, not just the HTTP status.
 
-Only wrapping the tools actually verified against live per-tool docs
-(get_addresses, search_menu, place_food_order) — see the plan file's
-"never invent tool names/parameters" rule. Add more as they're verified,
-not before.
+Only wrapping tools actually verified against live per-tool docs
+(get_addresses, search_menu, update_food_cart, get_food_cart,
+place_food_order, check_payment_status, confirm_order) — see the plan
+file's "never invent tool names/parameters" rule. Add more as they're
+verified, not before.
 """
 
 import asyncio
@@ -62,9 +63,22 @@ async def _call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _unwrap(result: dict[str, Any]) -> dict[str, Any]:
+    """Verified live on get_addresses: despite what the docs describe, the
+    actual payload sits under `structuredContent`, not `data` — `data` isn't
+    present at all. Checking both rather than trusting either blindly, since
+    this API's docs have now been wrong about response shape more than
+    once. Falls back to the raw result if neither key is present."""
+    if "structuredContent" in result:
+        return result["structuredContent"]
+    if "data" in result:
+        return result["data"]
+    return result
+
+
 async def get_addresses() -> list[dict[str, Any]]:
     result = await _call_tool("get_addresses", {})
-    return result.get("data", {}).get("addresses", result.get("data", []))
+    return _unwrap(result).get("addresses", [])
 
 
 async def search_menu(
@@ -76,7 +90,7 @@ async def search_menu(
     if offset is not None:
         args["offset"] = offset
     result = await _call_tool("search_menu", args)
-    return result.get("data", result)
+    return _unwrap(result)
 
 
 async def update_food_cart(
@@ -88,12 +102,12 @@ async def update_food_cart(
         "cartItems": [{"menu_item_id": menu_item_id, "quantity": quantity}],
     }
     result = await _call_tool("update_food_cart", args)
-    return result.get("data", result)
+    return _unwrap(result)
 
 
 async def get_food_cart(address_id: str) -> dict[str, Any]:
     result = await _call_tool("get_food_cart", {"addressId": address_id})
-    return result.get("data", result)
+    return _unwrap(result)
 
 
 async def place_food_order(
@@ -104,7 +118,8 @@ async def place_food_order(
     args: dict[str, Any] = {"addressId": address_id, "paymentMethod": payment_method}
     if payment_method == "UPI" and generate_upi_qr:
         args["generateUPIQR"] = True
-    return await _call_tool("place_food_order", args)
+    result = await _call_tool("place_food_order", args)
+    return _unwrap(result)
 
 
 async def check_payment_status(paas_id: str, **extra: Any) -> dict[str, Any]:
@@ -112,7 +127,7 @@ async def check_payment_status(paas_id: str, **extra: Any) -> dict[str, Any]:
     # optional, but pass through whatever's available for auto-confirm on Swiggy's side.
     args = {"paasId": paas_id, **{k: v for k, v in extra.items() if v is not None}}
     result = await _call_tool("check_payment_status", args)
-    return result.get("data", result)
+    return _unwrap(result)
 
 
 async def confirm_order(
@@ -127,4 +142,4 @@ async def confirm_order(
     if cart_id:
         args["cartId"] = cart_id
     result = await _call_tool("confirm_order", args)
-    return result.get("data", result)
+    return _unwrap(result)
