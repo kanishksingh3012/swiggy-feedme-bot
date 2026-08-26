@@ -12,9 +12,16 @@ from feedme_bot.intent import (
     classify_message,
     extract_intent,
     resolve_confirmation,
+    resolve_numbered_choice,
     resolve_selection,
 )
-from feedme_bot.state import PendingConfirmation, PendingOptions, UserState, store
+from feedme_bot.state import (
+    PendingAddressChoice,
+    PendingConfirmation,
+    PendingOptions,
+    UserState,
+    store,
+)
 
 # search_menu returns no ETA field at all (only search_restaurants would) — so
 # intent.max_eta_mins can't actually be honored by this item-search-based flow.
@@ -52,13 +59,66 @@ def _filter_candidates(
     return in_stock, True
 
 
-async def _start_new_order(user: UserState, text: str) -> str:
-    intent = extract_intent(text)
+def _resolve_address(jid: str, user: UserState, addresses: list[dict[str, Any]]) -> str | None:
+    """Returns an address id if resolvable without asking, else None (caller
+    must prompt via pending_address_choice). Only ever asks once per user —
+    a "Home"-tagged address or a previously-made choice short-circuits it."""
+    if len(addresses) == 1:
+        return addresses[0].get("id")
+
+    if user.default_address_id:
+        return user.default_address_id
+
+    home_matches = [a for a in addresses if (a.get("addressTag") or "").strip().lower() == "home"]
+    if len(home_matches) == 1:
+        address_id = home_matches[0].get("id")
+        if address_id:
+            store.set_default_address(jid, address_id)
+        return address_id
+
+    return None
+
+
+ADDRESS_PAGE_SIZE = 3
+
+
+def _sort_home_first(addresses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        addresses, key=lambda a: 0 if (a.get("addressTag") or "").strip().lower() == "home" else 1
+    )
+
+
+def _format_address_tag(index: int, address: dict[str, Any]) -> str:
+    # Tag only, not the full address line — keeps the one-time picker short.
+    tag = address.get("addressTag") or f"Address {index}"
+    return f"{index}️⃣ {tag}"
+
+
+def _address_prompt(candidates: list[dict[str, Any]], shown_count: int) -> str:
+    shown = candidates[:shown_count]
+    listing = "\n".join(_format_address_tag(i + 1, a) for i, a in enumerate(shown))
+    footer = 'Reply with the number'
+    if shown_count < len(candidates):
+        footer += ', or say "show more" for the rest'
+    footer += " — I'll remember it for next time, no need to pick again."
+    return f"Which address should I deliver to?\n\n{listing}\n\n{footer}"
+
+
+async def _start_new_order(jid: str, user: UserState, text: str) -> str:
+    recent_names = [o.get("name", "") for o in user.order_history[-5:] if o.get("name")]
+    intent = extract_intent(text, order_history=recent_names or None)
 
     addresses = await swiggy_client.get_addresses()
     if not addresses:
         return "No saved address on your Swiggy account — add one before I can search."
-    address_id = addresses[0].get("addressId") or addresses[0].get("id")
+
+    address_id = _resolve_address(jid, user, addresses)
+    if address_id is None:
+        ordered = _sort_home_first(addresses)
+        user.pending_address_choice = PendingAddressChoice(
+            candidates=ordered, original_text=text, shown_count=min(ADDRESS_PAGE_SIZE, len(ordered))
+        )
+        return _address_prompt(ordered, user.pending_address_choice.shown_count)
 
     search = await swiggy_client.search_menu(
         address_id, intent.query, veg_only=(intent.dietary_preference == "veg")
@@ -159,7 +219,31 @@ async def handle_message(jid: str, text: str) -> str:
     user = store.get(jid)
 
     # A pending checkout confirmation takes priority over everything else —
-    # this is the hard gate before place_food_order, never skip it.
+    # this is the hard gate before place_food_order, never skip it. Address
+    # picking comes next since it blocks the order from even being searched.
+    if user.pending_confirmation is None and user.pending_address_choice is not None:
+        pending = user.pending_address_choice
+        if pending.is_expired():
+            user.pending_address_choice = None
+            return "That timed out — send your order again?"
+
+        lowered = text.strip().lower()
+        wants_more = any(kw in lowered for kw in ("more", "other", "else", "none of"))
+        if wants_more and pending.shown_count < len(pending.candidates):
+            pending.shown_count = len(pending.candidates)
+            return _address_prompt(pending.candidates, pending.shown_count)
+
+        choice_num = resolve_numbered_choice(text, pending.shown_count)
+        if choice_num is None:
+            return f'Not sure which one — reply with a number, 1-{pending.shown_count}.'
+
+        chosen_id = pending.candidates[choice_num - 1].get("id")
+        original_text = pending.original_text
+        user.pending_address_choice = None
+        if chosen_id:
+            store.set_default_address(jid, chosen_id)
+        return await _start_new_order(jid, user, original_text)
+
     if user.pending_confirmation is not None:
         if user.pending_confirmation.is_expired():
             user.pending_confirmation = None
@@ -196,7 +280,7 @@ async def handle_message(jid: str, text: str) -> str:
         kind = classify_message(text, has_pending_options=True)
         if kind == "new_order":
             user.pending_options = None
-            return await _start_new_order(user, text)
+            return await _start_new_order(jid, user, text)
         if kind == "selection":
             choice = resolve_selection(text)
             if choice == "unclear":
@@ -226,4 +310,4 @@ async def handle_message(jid: str, text: str) -> str:
     kind = classify_message(text, has_pending_options=False)
     if kind == "not_food":
         return "I only handle food orders here — tell me what you're craving."
-    return await _start_new_order(user, text)
+    return await _start_new_order(jid, user, text)

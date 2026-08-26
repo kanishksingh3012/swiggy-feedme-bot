@@ -98,14 +98,24 @@ Examples:
 {"query": "burger", "max_price": null, "max_eta_mins": null,
  "dietary_preference": "any", "high_protein": false}
 
-Return ONLY valid JSON, no markdown fences."""
+If the message gives NO real signal at all about what food is wanted
+("I'm hungry", "get me something", "surprise me", "whatever's good") — not
+even a mood — do not guess a generic popular dish out of nowhere. If a list
+of the user's past orders is given below, pick something from (or close to)
+that history instead — that's their actual "usual", which is a far better
+default than a stereotype. Only fall back to a broadly popular dish if no
+past orders are given either."""
 
 
-def extract_intent(text: str) -> OrderIntent:
+def extract_intent(text: str, order_history: list[str] | None = None) -> OrderIntent:
+    system_prompt = EXTRACT_PROMPT
+    if order_history:
+        system_prompt += "\n\nUser's recent past orders: " + ", ".join(order_history)
+
     response = _client().chat.completions.create(
         model=MODEL,
         messages=[
-            {"role": "system", "content": EXTRACT_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
         ],
         temperature=0,
@@ -135,6 +145,30 @@ def resolve_selection(text: str) -> Literal["safe", "mood", "unclear"]:
     )
     raw = (response.choices[0].message.content or "").strip().lower()
     return raw if raw in ("safe", "mood") else "unclear"  # type: ignore[return-value]
+
+
+def resolve_numbered_choice(text: str, count: int) -> int | None:
+    """Which numbered option (1..count) did a free-form reply pick? Used
+    for the one-time address picker. Returns None if unclear."""
+    response = _client().chat.completions.create(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    f"The user was shown a numbered list of {count} options and asked to "
+                    f"pick one. Given their reply, answer with just the number (1-{count}), "
+                    "or the word 'unclear' if it doesn't clearly pick one."
+                ),
+            },
+            {"role": "user", "content": text},
+        ],
+        temperature=0,
+    )
+    raw = (response.choices[0].message.content or "").strip()
+    if raw.isdigit() and 1 <= int(raw) <= count:
+        return int(raw)
+    return None
 
 
 def resolve_confirmation(text: str) -> Literal["yes", "no", "unclear"]:
