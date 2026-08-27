@@ -8,9 +8,10 @@ isError on every call, not just the HTTP status.
 
 Only wrapping tools actually verified against live per-tool docs
 (get_addresses, search_menu, update_food_cart, get_food_cart,
-flush_food_cart, place_food_order, check_payment_status, confirm_order)
-— see the plan file's "never invent tool names/parameters" rule. Add
-more as they're verified, not before.
+flush_food_cart, get_payment_options, place_food_order,
+check_payment_status, confirm_order) — see the plan file's "never
+invent tool names/parameters" rule. Add more as they're verified, not
+before.
 """
 
 import asyncio
@@ -132,14 +133,22 @@ async def flush_food_cart() -> dict[str, Any]:
     return _unwrap(result)
 
 
+async def get_payment_options(address_id: str) -> dict[str, Any]:
+    result = await _call_tool("get_payment_options", {"addressId": address_id})
+    return _unwrap(result)
+
+
 async def place_food_order(
     address_id: str,
     payment_method: str,  # "Cash" or "UPI" — never "COD"/"PayWithQR", per verified findings
     generate_upi_qr: bool = False,
+    intent_app: str | None = None,  # e.g. "gpay://upi/" — byte-for-byte from get_payment_options
 ) -> dict[str, Any]:
     args: dict[str, Any] = {"addressId": address_id, "paymentMethod": payment_method}
     if payment_method == "UPI" and generate_upi_qr:
         args["generateUPIQR"] = True
+    if payment_method == "UPI" and intent_app:
+        args["intentApp"] = intent_app
     result = await _call_tool("place_food_order", args)
     return _unwrap(result)
 

@@ -50,10 +50,26 @@ class PendingAddressChoice:
 
 
 @dataclass
+class PendingPaymentChoice:
+    """Cart is validated and ready — waiting on which real payment method
+    (from get_payment_options, never invented) to actually place the order
+    with. Picking one of these IS the final purchase trigger."""
+
+    item: dict[str, Any]
+    address_id: str
+    options: dict[str, dict[str, Any]]  # button_id -> {payment_method, intent_app, generate_upi_qr}
+    created_at: float = field(default_factory=time.time)
+
+    def is_expired(self) -> bool:
+        return time.time() - self.created_at > PENDING_OPTIONS_TTL_SECONDS
+
+
+@dataclass
 class UserState:
     pending_options: PendingOptions | None = None
     pending_confirmation: PendingConfirmation | None = None
     pending_address_choice: PendingAddressChoice | None = None
+    pending_payment_choice: PendingPaymentChoice | None = None
     order_history: list[dict[str, Any]] = field(default_factory=list)
     default_address_id: str | None = None
     has_greeted: bool = False
@@ -140,6 +156,7 @@ class StateStore:
         user.pending_options = None
         user.pending_confirmation = None
         user.pending_address_choice = None
+        user.pending_payment_choice = None
 
 
 store = StateStore()

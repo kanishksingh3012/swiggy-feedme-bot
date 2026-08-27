@@ -26,9 +26,11 @@ from feedme_bot.state import (
     PendingAddressChoice,
     PendingConfirmation,
     PendingOptions,
+    PendingPaymentChoice,
     UserState,
     store,
 )
+
 
 def _swiggy_error_text(exc: swiggy_client.SwiggyToolError) -> str:
     """SwiggyToolError carries the raw isError:true payload — pull the
@@ -292,6 +294,55 @@ async def _poll_payment_and_finalize(
     await whatsapp.send_text(jid, "Still waiting on payment — check the Swiggy app if this takes a while.")
 
 
+WHATSAPP_PAYMENT_BUTTON_CAP = 3
+
+
+async def _offer_payment_options(
+    jid: str, user: UserState, item: dict[str, Any], address_id: str
+) -> None:
+    """Real payment methods only, from get_payment_options, never invented
+    — verified live that no "card" option exists on this account/API at
+    all, only UPI apps (each deep-links to that specific app), QR
+    (desktop-oriented), and COD. Picking one of the resulting buttons IS
+    the final purchase trigger, handled in handle_message's
+    pending_payment_choice branch."""
+    payment_data = await swiggy_client.get_payment_options(address_id)
+    options: dict[str, dict[str, Any]] = {}
+    buttons: list[tuple[str, str]] = []
+
+    cod = payment_data.get("cod", {})
+    if cod.get("available"):
+        bid = "pay:cod"
+        options[bid] = {"payment_method": "Cash"}
+        buttons.append((bid, (cod.get("displayName") or "Cash on Delivery")[:20]))
+
+    mobile_methods = payment_data.get("platforms", {}).get("mobile", {}).get("methods", [])
+    for method in mobile_methods:
+        if len(buttons) >= WHATSAPP_PAYMENT_BUTTON_CAP:
+            break
+        app_id = method.get("id")
+        if not app_id or not method.get("enabled", True):
+            continue
+        bid = f"pay:upi:{app_id}"
+        options[bid] = {"payment_method": "UPI", "intent_app": app_id}
+        buttons.append((bid, (method.get("displayName") or "UPI")[:20]))
+
+    if not buttons:
+        # Matches the tool's own guidance: don't attempt place_food_order
+        # with no real methods available.
+        await whatsapp.send_text(
+            jid, "No payment methods are available for this order right now — try again later?"
+        )
+        return
+
+    user.pending_payment_choice = PendingPaymentChoice(
+        item=item, address_id=address_id, options=options
+    )
+    price = payment_data.get("paymentAmount")
+    body = f"How do you want to pay{f' (₹{price})' if price else ''}?"
+    await whatsapp.send_reply_buttons(jid, body, buttons[:WHATSAPP_PAYMENT_BUTTON_CAP])
+
+
 async def handle_message(jid: str, text: str, interactive_id: str | None = None) -> None:
     user = store.get(jid)
 
@@ -314,6 +365,54 @@ async def handle_message(jid: str, text: str, interactive_id: str | None = None)
             await whatsapp.send_text(jid, "No saved addresses on your Swiggy account to switch to.")
             return
         await _ask_address(jid, user, addresses, "")
+        return
+
+    # Picking a payment method IS the final purchase trigger — this is the
+    # actual hard gate before place_food_order now, checked first.
+    if user.pending_payment_choice is not None:
+        pending_p = user.pending_payment_choice
+        if pending_p.is_expired():
+            user.pending_payment_choice = None
+            await whatsapp.send_text(jid, "That timed out — want to confirm the order again?")
+            return
+
+        spec = pending_p.options.get(interactive_id or "")
+        if spec is None:
+            await whatsapp.send_text(jid, "Tap one of the payment options above.")
+            return
+
+        item = pending_p.item
+        address_id = pending_p.address_id
+        user.pending_payment_choice = None
+
+        try:
+            result = await swiggy_client.place_food_order(
+                address_id,
+                payment_method=spec["payment_method"],
+                generate_upi_qr=spec.get("generate_upi_qr", False),
+                intent_app=spec.get("intent_app"),
+            )
+        except swiggy_client.SwiggyToolError as exc:
+            reason = _swiggy_error_text(exc)
+            await whatsapp.send_text(jid, f"Couldn't place the order: {reason}. Nothing was charged.")
+            return
+        except Exception:
+            await whatsapp.send_text(
+                jid, "Something went wrong placing the order — nothing was charged. Try again?"
+            )
+            raise
+
+        if result.get("status") == "PENDING_PAYMENT" or result.get("normalizedStatus") == "pending":
+            user.order_history.append(item)
+            await _poll_payment_and_finalize(jid, result, address_id)
+            return
+
+        user.order_history.append(item)
+        await whatsapp.send_text(
+            jid,
+            f"Order placed! {item.get('name', 'Your order')} is on its way. "
+            "Track it in the Swiggy app — no more messages from me on this one.",
+        )
         return
 
     # A pending checkout confirmation takes priority over everything else —
@@ -374,39 +473,7 @@ async def handle_message(jid: str, text: str, interactive_id: str | None = None)
                 await whatsapp.send_text(jid, error)
                 return
 
-            fresh_price = cart.get("pricing", {}).get("to_pay") if cart else None
-            # Default to Cash/COD for now — payment method choice (UPI apps,
-            # COD) is the next increment, not built yet, see plan checklist.
-            try:
-                result = await swiggy_client.place_food_order(address_id, payment_method="Cash")
-            except swiggy_client.SwiggyToolError as exc:
-                # Real live failure caught: this raised all the way up to
-                # main.py's catch-all before, which only logs - the user got
-                # total silence instead of a reason. Never let checkout fail
-                # without telling the user something.
-                reason = _swiggy_error_text(exc)
-                await whatsapp.send_text(
-                    jid, f"Couldn't place the order: {reason}. Nothing was charged."
-                )
-                return
-            except Exception:
-                await whatsapp.send_text(
-                    jid, "Something went wrong placing the order — nothing was charged. Try again?"
-                )
-                raise
-
-            if result.get("status") == "PENDING_PAYMENT" or result.get("normalizedStatus") == "pending":
-                user.order_history.append(item)
-                await _poll_payment_and_finalize(jid, result, address_id)
-                return
-
-            user.order_history.append(item)
-            price_note = f" (₹{fresh_price})" if fresh_price else ""
-            await whatsapp.send_text(
-                jid,
-                f"Order placed! {item.get('name', 'Your order')}{price_note} is on its way. "
-                "Track it in the Swiggy app — no more messages from me on this one.",
-            )
+            await _offer_payment_options(jid, user, item, address_id)
         elif decision == "no":
             user.pending_confirmation = None
             await whatsapp.send_text(jid, "No worries, cancelled.")
