@@ -282,9 +282,7 @@ async def _poll_payment_and_finalize(
                     await swiggy_client.confirm_order(
                         order_id, address_id, lat, lng, cart_id=place_result.get("cartId")
                     )
-            await whatsapp.send_text(
-                jid, "Order placed! Track it in the Swiggy app — no more messages from me on this one."
-            )
+            await whatsapp.send_text(jid, "Order placed! Track it in the Swiggy app.")
             return
 
         if status.get("isTerminalFailure"):
@@ -409,9 +407,7 @@ async def handle_message(jid: str, text: str, interactive_id: str | None = None)
 
         user.order_history.append(item)
         await whatsapp.send_text(
-            jid,
-            f"Order placed! {item.get('name', 'Your order')} is on its way. "
-            "Track it in the Swiggy app — no more messages from me on this one.",
+            jid, f"Order placed! {item.get('name', 'Your order')} is on its way. Track it in the Swiggy app."
         )
         return
 
