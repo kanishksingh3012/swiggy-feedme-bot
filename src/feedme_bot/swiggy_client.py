@@ -83,14 +83,30 @@ async def get_addresses() -> list[dict[str, Any]]:
 
 
 async def search_menu(
-    address_id: str, query: str, veg_only: bool = False, offset: int | None = None
+    address_id: str,
+    query: str,
+    veg_only: bool = False,
+    offset: int | None = None,
+    restaurant_id: str | None = None,
 ) -> dict[str, Any]:
     args: dict[str, Any] = {"addressId": address_id, "query": query}
     if veg_only:
         args["vegFilter"] = 1
     if offset is not None:
         args["offset"] = offset
+    if restaurant_id:
+        args["restaurantIdOfAddedItem"] = restaurant_id
     result = await _call_tool("search_menu", args)
+    return _unwrap(result)
+
+
+async def search_restaurants(
+    address_id: str, query: str, offset: int | None = None
+) -> dict[str, Any]:
+    args: dict[str, Any] = {"addressId": address_id, "query": query}
+    if offset is not None:
+        args["offset"] = offset
+    result = await _call_tool("search_restaurants", args)
     return _unwrap(result)
 
 

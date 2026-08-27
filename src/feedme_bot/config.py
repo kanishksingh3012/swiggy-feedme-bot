@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     meta_whatsapp_token: str = ""
     meta_phone_number_id: str = ""
     meta_webhook_verify_token: str = ""
+    # App Dashboard -> Settings -> Basic -> App secret. Used to verify the
+    # X-Hub-Signature-256 header on every inbound webhook POST — without
+    # this, anyone who finds the public webhook URL can forge a WhatsApp
+    # message payload directly (e.g. a fake "Yes" tap on a payment choice)
+    # with nothing to stop it.
+    meta_app_secret: str = ""
 
     # Phase 1: only this number may talk to the bot — everyone else is ignored.
     allowed_whatsapp_number: str = ""

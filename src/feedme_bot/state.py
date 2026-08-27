@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field
@@ -9,6 +10,13 @@ from typing import Any
 # price/availability drift between search and confirm).
 PENDING_OPTIONS_TTL_SECONDS = 15 * 60
 
+# Address choice (and a bare retry-with-a-different-dish) carry no price or
+# availability drift risk at all — it's just "where should this go" / "who
+# was I talking to a minute ago", not a live cart quote going stale. A real
+# human reading a WhatsApp message and tapping a button 20+ minutes later is
+# completely normal, so these get a much longer leash than priced options.
+PENDING_ADDRESS_TTL_SECONDS = 60 * 60
+
 DEFAULT_ADDRESS_PATH = Path("~/.config/feedme-bot/default_addresses.json").expanduser()
 ADDRESS_USAGE_PATH = Path("~/.config/feedme-bot/address_usage.json").expanduser()
 
@@ -17,6 +25,23 @@ ADDRESS_USAGE_PATH = Path("~/.config/feedme-bot/address_usage.json").expanduser(
 class PendingOptions:
     safe_pick: dict[str, Any]
     mood_pick: dict[str, Any]
+    address_id: str
+    # Everything else that passed the price/stock filter, minus safe_pick and
+    # mood_pick — kept around so "give me more" can serve real leftover
+    # candidates instantly instead of re-searching or, worse, guessing.
+    remaining: list[dict[str, Any]] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+
+    def is_expired(self) -> bool:
+        return time.time() - self.created_at > PENDING_OPTIONS_TTL_SECONDS
+
+
+@dataclass
+class PendingMoreOptions:
+    """Up to 3 additional candidates shown after "give me more" — same
+    price/availability drift risk as the original pair, so same TTL."""
+
+    items: list[dict[str, Any]]
     address_id: str
     created_at: float = field(default_factory=time.time)
 
@@ -46,7 +71,24 @@ class PendingAddressChoice:
     created_at: float = field(default_factory=time.time)
 
     def is_expired(self) -> bool:
-        return time.time() - self.created_at > PENDING_OPTIONS_TTL_SECONDS
+        return time.time() - self.created_at > PENDING_ADDRESS_TTL_SECONDS
+
+
+@dataclass
+class PendingDishRetry:
+    """A search came up empty/ambiguous after address was already resolved —
+    the very next message continues *this* order attempt rather than
+    starting a fresh one. Without this, "try a different dish" falls through
+    to _start_new_order's normal path, which always re-asks for an address
+    (per the explicit "never silently reuse a remembered default" rule) —
+    correct for an actual new order, wrong for "that guess didn't work,
+    here's another dish" in the same breath."""
+
+    address_id: str
+    created_at: float = field(default_factory=time.time)
+
+    def is_expired(self) -> bool:
+        return time.time() - self.created_at > PENDING_ADDRESS_TTL_SECONDS
 
 
 @dataclass
@@ -70,6 +112,8 @@ class UserState:
     pending_confirmation: PendingConfirmation | None = None
     pending_address_choice: PendingAddressChoice | None = None
     pending_payment_choice: PendingPaymentChoice | None = None
+    pending_dish_retry: PendingDishRetry | None = None
+    pending_more_options: PendingMoreOptions | None = None
     order_history: list[dict[str, Any]] = field(default_factory=list)
     default_address_id: str | None = None
     has_greeted: bool = False
@@ -120,6 +164,14 @@ class StateStore:
         self._users: dict[str, UserState] = {}
         self._default_addresses = _load_default_addresses()
         self._address_usage = _load_address_usage()
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def get_lock(self, jid: str) -> asyncio.Lock:
+        """One lock per JID so two webhook deliveries for the same user
+        (a Meta retry, a double-tap) can't race on the same UserState —
+        e.g. both reading pending_confirmation before either clears it,
+        which could double-add to cart or double-place a real order."""
+        return self._locks.setdefault(jid, asyncio.Lock())
 
     def get(self, jid: str) -> UserState:
         user = self._users.setdefault(jid, UserState())
@@ -157,6 +209,8 @@ class StateStore:
         user.pending_confirmation = None
         user.pending_address_choice = None
         user.pending_payment_choice = None
+        user.pending_dish_retry = None
+        user.pending_more_options = None
 
 
 store = StateStore()
