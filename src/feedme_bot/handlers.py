@@ -57,15 +57,14 @@ def _greeting_prefix(user: UserState) -> str:
 
 
 def _resolve_address(jid: str, user: UserState, addresses: list[dict[str, Any]]) -> str | None:
-    """Returns an address id if unambiguous (exactly one address, or a
-    remembered choice from a previous order), else None — caller must ask.
-    Deliberately does NOT auto-pick a uniquely "Home"-tagged address on its
-    own; that silent behavior was confusing (looked like a bug) — always
-    ask when there's real choice to make, just make Home easy to spot."""
+    """Returns an address id only when there's truly nothing to choose
+    (exactly one saved address), else None — caller must ask. Explicit
+    direction: always ask when there's more than one address, every time,
+    no remembered-default skip. (default_address_id / usage tracking stay
+    in state.py, just unused for auto-resolution now — kept in case this
+    changes again, not deleted.)"""
     if len(addresses) == 1:
         return addresses[0].get("id")
-    if user.default_address_id:
-        return user.default_address_id
     return None
 
 
