@@ -8,9 +8,9 @@ isError on every call, not just the HTTP status.
 
 Only wrapping tools actually verified against live per-tool docs
 (get_addresses, search_menu, update_food_cart, get_food_cart,
-place_food_order, check_payment_status, confirm_order) — see the plan
-file's "never invent tool names/parameters" rule. Add more as they're
-verified, not before.
+flush_food_cart, place_food_order, check_payment_status, confirm_order)
+— see the plan file's "never invent tool names/parameters" rule. Add
+more as they're verified, not before.
 """
 
 import asyncio
@@ -107,6 +107,11 @@ async def update_food_cart(
 
 async def get_food_cart(address_id: str) -> dict[str, Any]:
     result = await _call_tool("get_food_cart", {"addressId": address_id})
+    return _unwrap(result)
+
+
+async def flush_food_cart() -> dict[str, Any]:
+    result = await _call_tool("flush_food_cart", {})
     return _unwrap(result)
 
 

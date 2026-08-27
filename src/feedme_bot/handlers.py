@@ -164,6 +164,20 @@ async def _start_new_order(jid: str, user: UserState, text: str) -> None:
     )
 
 
+def _cart_error(cart: dict[str, Any]) -> str | None:
+    """Cart-mutation responses use a different envelope than search/address
+    calls (statusCode/successful/titleMessage, not items/data) — verified
+    live after a real INVALID_ADDON failure. Surface Swiggy's own message
+    rather than a generic fallback when successful is explicitly False."""
+    if cart.get("successful") is False:
+        return (
+            cart.get("titleMessage")
+            or cart.get("statusMessage")
+            or "That item couldn't be added — the restaurant may require picking a size/variant we don't handle yet."
+        )
+    return None
+
+
 async def _add_to_cart_and_revalidate(
     item: dict[str, Any], address_id: str
 ) -> tuple[dict[str, Any] | None, str | None]:
@@ -176,8 +190,21 @@ async def _add_to_cart_and_revalidate(
     if not menu_item_id or not restaurant_id:
         return None, "Lost track of which item this was — mind resending your request?"
 
-    await swiggy_client.update_food_cart(address_id, restaurant_id, str(menu_item_id))
+    update_result = await swiggy_client.update_food_cart(address_id, restaurant_id, str(menu_item_id))
+    error = _cart_error(update_result)
+    if error:
+        # Known gap: this is very likely a mandatory-addon item we don't
+        # handle yet (see plan checklist) — clear the now-invalid cart so a
+        # retry isn't blocked by leftover bad state, rather than silently
+        # leaving it stuck.
+        await swiggy_client.flush_food_cart()
+        return None, error
+
     cart = await swiggy_client.get_food_cart(address_id)
+    error = _cart_error(cart)
+    if error:
+        await swiggy_client.flush_food_cart()
+        return None, error
 
     cart_items = cart.get("items", [])
     matching = next((c for c in cart_items if c.get("menu_item_id") == menu_item_id), None)
