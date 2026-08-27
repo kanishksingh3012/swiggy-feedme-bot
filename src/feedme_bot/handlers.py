@@ -220,7 +220,12 @@ async def _add_to_cart_and_revalidate(
         return None, error
 
     cart_items = cart.get("items", [])
-    matching = next((c for c in cart_items if c.get("menu_item_id") == menu_item_id), None)
+    # Verified live: search_menu's menu_item_id is a string, the cart
+    # response's is an int for the same item — compare as strings on both
+    # sides rather than assume either type.
+    matching = next(
+        (c for c in cart_items if str(c.get("menu_item_id")) == str(menu_item_id)), None
+    )
     if matching is None:
         return None, "Couldn't confirm that item made it into the cart — want to try again?"
     if not matching.get("in_stock", True):

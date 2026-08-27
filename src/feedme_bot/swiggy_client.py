@@ -93,6 +93,23 @@ async def search_menu(
     return _unwrap(result)
 
 
+def _unwrap_cart(result: dict[str, Any]) -> dict[str, Any]:
+    """Cart-mutation responses (update_food_cart/get_food_cart) have a
+    second, Swiggy-specific "data" nesting on top of the outer MCP
+    envelope _unwrap() already handles — verified live: a successful
+    response looks like {"statusCode":0,...,"data":{"items":[...],
+    "pricing":{...}}}, while a failure looks like
+    {"successful":false,"data":null,"titleMessage":...} with no nested
+    items at all. Drill into the inner "data" only when it actually holds
+    the cart payload, so failure responses (checked via _cart_error in
+    handlers.py) aren't masked by this."""
+    unwrapped = _unwrap(result)
+    inner = unwrapped.get("data")
+    if isinstance(inner, dict) and "items" in inner:
+        return inner
+    return unwrapped
+
+
 async def update_food_cart(
     address_id: str, restaurant_id: str, menu_item_id: str, quantity: int = 1
 ) -> dict[str, Any]:
@@ -102,12 +119,12 @@ async def update_food_cart(
         "cartItems": [{"menu_item_id": menu_item_id, "quantity": quantity}],
     }
     result = await _call_tool("update_food_cart", args)
-    return _unwrap(result)
+    return _unwrap_cart(result)
 
 
 async def get_food_cart(address_id: str) -> dict[str, Any]:
     result = await _call_tool("get_food_cart", {"addressId": address_id})
-    return _unwrap(result)
+    return _unwrap_cart(result)
 
 
 async def flush_food_cart() -> dict[str, Any]:
