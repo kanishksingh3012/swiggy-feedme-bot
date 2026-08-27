@@ -10,6 +10,7 @@ from typing import Any
 PENDING_OPTIONS_TTL_SECONDS = 15 * 60
 
 DEFAULT_ADDRESS_PATH = Path("~/.config/feedme-bot/default_addresses.json").expanduser()
+ADDRESS_USAGE_PATH = Path("~/.config/feedme-bot/address_usage.json").expanduser()
 
 
 @dataclass
@@ -74,6 +75,20 @@ def _save_default_address(jid: str, address_id: str) -> None:
     DEFAULT_ADDRESS_PATH.write_text(json.dumps(data, indent=2))
 
 
+def _load_address_usage() -> dict[str, dict[str, int]]:
+    if not ADDRESS_USAGE_PATH.exists():
+        return {}
+    try:
+        return json.loads(ADDRESS_USAGE_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_address_usage(data: dict[str, dict[str, int]]) -> None:
+    ADDRESS_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ADDRESS_USAGE_PATH.write_text(json.dumps(data, indent=2))
+
+
 class StateStore:
     """In-memory, JID-keyed session state.
 
@@ -88,6 +103,7 @@ class StateStore:
     def __init__(self) -> None:
         self._users: dict[str, UserState] = {}
         self._default_addresses = _load_default_addresses()
+        self._address_usage = _load_address_usage()
 
     def get(self, jid: str) -> UserState:
         user = self._users.setdefault(jid, UserState())
@@ -99,6 +115,25 @@ class StateStore:
         self.get(jid).default_address_id = address_id
         self._default_addresses[jid] = address_id
         _save_default_address(jid, address_id)
+
+    def record_address_use(self, jid: str, address_id: str) -> None:
+        per_user = self._address_usage.setdefault(jid, {})
+        per_user[address_id] = per_user.get(address_id, 0) + 1
+        _save_address_usage(self._address_usage)
+
+    def top_addresses(
+        self, jid: str, addresses: list[dict[str, Any]], limit: int
+    ) -> list[dict[str, Any]]:
+        """Ranks by actual usage frequency (most-used first), falling back
+        to Home-tagged-first, then original order, when there's no usage
+        history yet to rank by (e.g. before any order has completed)."""
+        usage = self._address_usage.get(jid, {})
+
+        def sort_key(a: dict[str, Any]) -> tuple[int, int]:
+            is_home = 0 if (a.get("addressTag") or "").strip().lower() == "home" else 1
+            return (-usage.get(a.get("id", ""), 0), is_home)
+
+        return sorted(addresses, key=sort_key)[:limit]
 
     def clear_pending(self, jid: str) -> None:
         user = self.get(jid)

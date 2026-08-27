@@ -35,7 +35,7 @@ from feedme_bot.state import (
 # Not silently ignoring it: surfaced as a known gap here rather than faked.
 PRICE_RELAXATION_FACTOR = 1.25
 GREETING = "Hey! Let's find you something good."
-WHATSAPP_ADDRESS_ROW_CAP = 10  # verified live against Meta's docs
+WHATSAPP_ADDRESS_BUTTON_CAP = 3  # WhatsApp reply buttons hard-cap at 3, verified live
 CHANGE_ADDRESS_TRIGGER_WORDS = ("change", "different", "another", "switch", "new")
 
 
@@ -67,12 +67,6 @@ def _resolve_address(jid: str, user: UserState, addresses: list[dict[str, Any]])
     if user.default_address_id:
         return user.default_address_id
     return None
-
-
-def _sort_home_first(addresses: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(
-        addresses, key=lambda a: 0 if (a.get("addressTag") or "").strip().lower() == "home" else 1
-    )
 
 
 def _filter_candidates(
@@ -112,18 +106,19 @@ def _filter_candidates(
 
 
 async def _ask_address(jid: str, user: UserState, addresses: list[dict[str, Any]], text: str) -> None:
-    ordered = _sort_home_first(addresses)[:WHATSAPP_ADDRESS_ROW_CAP]
-    user.pending_address_choice = PendingAddressChoice(candidates=ordered, original_text=text)
-    rows = [
-        (
-            f"addr:{a.get('id')}",
-            a.get("addressTag") or f"Address {i + 1}",
-            (a.get("addressLine") or "")[:72],
-        )
-        for i, a in enumerate(ordered)
+    # Buttons, not a list — WhatsApp reply buttons open with a single tap,
+    # no bottom-sheet step, but hard-cap at 3. Ranked by actual usage
+    # frequency (falls back to Home-first before any usage history exists).
+    # Known tradeoff: any address outside the top 3 isn't reachable through
+    # this picker at all — accepted explicitly in favor of fewer taps.
+    top = store.top_addresses(jid, addresses, WHATSAPP_ADDRESS_BUTTON_CAP)
+    user.pending_address_choice = PendingAddressChoice(candidates=top, original_text=text)
+    buttons = [
+        (f"addr:{a.get('id')}", a.get("addressTag") or f"Address {i + 1}")
+        for i, a in enumerate(top)
     ]
     body = _greeting_prefix(user) + "Which address should this go to?"
-    await whatsapp.send_list(jid, body, "Choose address", rows)
+    await whatsapp.send_reply_buttons(jid, body, buttons)
 
 
 async def _start_new_order(jid: str, user: UserState, text: str) -> None:
@@ -141,6 +136,7 @@ async def _start_new_order(jid: str, user: UserState, text: str) -> None:
     if address_id is None:
         await _ask_address(jid, user, addresses, text)
         return
+    store.record_address_use(jid, address_id)
 
     search = await swiggy_client.search_menu(
         address_id, intent.query, veg_only=(intent.dietary_preference == "veg")
