@@ -36,6 +36,7 @@ from feedme_bot.state import (
 PRICE_RELAXATION_FACTOR = 1.25
 GREETING = "Hey! Let's find you something good."
 WHATSAPP_ADDRESS_ROW_CAP = 10  # verified live against Meta's docs
+CHANGE_ADDRESS_TRIGGER_WORDS = ("change", "different", "another", "switch", "new")
 
 
 def _item_line(item: dict[str, Any]) -> str:
@@ -77,8 +78,20 @@ def _sort_home_first(addresses: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _filter_candidates(
     items: list[dict[str, Any]], max_price: float | None
 ) -> tuple[list[dict[str, Any]], bool]:
-    """In-stock always; price only if given. Returns (filtered, was_relaxed)."""
-    in_stock = [item for item in items if item.get("inStock", True)]
+    """In-stock and addon-free always; price only if given. Returns (filtered, was_relaxed).
+
+    Excluding hasAddons/hasVariants items is a coarse, deliberate tradeoff —
+    search_menu can't tell us whether an addon group is mandatory (only the
+    cart response's min/max constraints can, and that's only known after
+    trying to add it), so this also excludes some optional-addon items that
+    would've worked fine. Traded for never suggesting a dish that then fails
+    at checkout, per explicit direction — see plan notes on INVALID_ADDON."""
+    processable = [
+        item
+        for item in items
+        if item.get("inStock", True) and not item.get("hasAddons") and not item.get("hasVariants")
+    ]
+    in_stock = processable
     if max_price is None:
         return in_stock, False
 
@@ -265,6 +278,27 @@ async def _poll_payment_and_finalize(
 async def handle_message(jid: str, text: str, interactive_id: str | None = None) -> None:
     user = store.get(jid)
 
+    # Checked before any pending state, on purpose — "change address" should
+    # work no matter where the user is in the flow, not get misclassified as
+    # a dish "modification" by whatever's currently pending.
+    lowered_text = text.strip().lower()
+    wants_address_change = (
+        interactive_id is None
+        and "address" in lowered_text
+        and any(w in lowered_text for w in CHANGE_ADDRESS_TRIGGER_WORDS)
+    )
+    if wants_address_change:
+        user.pending_options = None
+        user.pending_confirmation = None
+        user.pending_address_choice = None
+        user.default_address_id = None
+        addresses = await swiggy_client.get_addresses()
+        if not addresses:
+            await whatsapp.send_text(jid, "No saved addresses on your Swiggy account to switch to.")
+            return
+        await _ask_address(jid, user, addresses, "")
+        return
+
     # A pending checkout confirmation takes priority over everything else —
     # this is the hard gate before place_food_order, never skip it. Address
     # picking comes next since it blocks the order from even being searched.
@@ -290,6 +324,12 @@ async def handle_message(jid: str, text: str, interactive_id: str | None = None)
         original_text = pending.original_text
         user.pending_address_choice = None
         store.set_default_address(jid, chosen_id)
+        if not original_text:
+            # Triggered by a standalone "change address" request, not a
+            # pending order — just confirm the switch, don't search on a
+            # blank query.
+            await whatsapp.send_text(jid, "Got it — using that address from now on.")
+            return
         await _start_new_order(jid, user, original_text)
         return
 
