@@ -1,13 +1,20 @@
 """Core message-handling logic, deliberately kept separate from the
-FastAPI/WhatsApp transport layer (main.py, whatsapp.py) so it can be
-exercised directly — e.g. from a script or test — without a live webhook.
-That's the "build the backend now, wire WhatsApp once unblocked" plan.
+FastAPI/WhatsApp transport layer (main.py) so it can be exercised
+directly — e.g. from a script or test — without a live webhook.
+
+Sends replies itself (via whatsapp.py) rather than returning a string,
+since replies are now interactive messages (buttons/lists), not just
+plain text — main.py just hands off the incoming message and moves on.
+
+Tap-first design: every pending state is driven primarily by a known
+interactive_id (a button/list-row tap), with the old LLM-based text
+resolvers kept as a fallback for when the user types instead of tapping.
 """
 
 import asyncio
 from typing import Any
 
-from feedme_bot import rank, swiggy_client
+from feedme_bot import rank, swiggy_client, whatsapp
 from feedme_bot.intent import (
     classify_message,
     extract_intent,
@@ -27,12 +34,44 @@ from feedme_bot.state import (
 # intent.max_eta_mins can't actually be honored by this item-search-based flow.
 # Not silently ignoring it: surfaced as a known gap here rather than faked.
 PRICE_RELAXATION_FACTOR = 1.25
+GREETING = "Hey! Let's find you something good."
+WHATSAPP_ADDRESS_ROW_CAP = 10  # verified live against Meta's docs
 
 
-def _format_item(label: str, item: dict[str, Any]) -> str:
+def _item_line(item: dict[str, Any]) -> str:
     name = item.get("name", "?")
     price = item.get("price", "?")
-    return f"{label}: {name}\n• Price: ₹{price}"
+    restaurant = item.get("restaurant_name", "")
+    line = f"{name} — ₹{price}"
+    if restaurant:
+        line += f" — {restaurant}"
+    return line
+
+
+def _greeting_prefix(user: UserState) -> str:
+    if user.has_greeted:
+        return ""
+    user.has_greeted = True
+    return f"{GREETING}\n\n"
+
+
+def _resolve_address(jid: str, user: UserState, addresses: list[dict[str, Any]]) -> str | None:
+    """Returns an address id if unambiguous (exactly one address, or a
+    remembered choice from a previous order), else None — caller must ask.
+    Deliberately does NOT auto-pick a uniquely "Home"-tagged address on its
+    own; that silent behavior was confusing (looked like a bug) — always
+    ask when there's real choice to make, just make Home easy to spot."""
+    if len(addresses) == 1:
+        return addresses[0].get("id")
+    if user.default_address_id:
+        return user.default_address_id
+    return None
+
+
+def _sort_home_first(addresses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        addresses, key=lambda a: 0 if (a.get("addressTag") or "").strip().lower() == "home" else 1
+    )
 
 
 def _filter_candidates(
@@ -59,66 +98,36 @@ def _filter_candidates(
     return in_stock, True
 
 
-def _resolve_address(jid: str, user: UserState, addresses: list[dict[str, Any]]) -> str | None:
-    """Returns an address id if resolvable without asking, else None (caller
-    must prompt via pending_address_choice). Only ever asks once per user —
-    a "Home"-tagged address or a previously-made choice short-circuits it."""
-    if len(addresses) == 1:
-        return addresses[0].get("id")
-
-    if user.default_address_id:
-        return user.default_address_id
-
-    home_matches = [a for a in addresses if (a.get("addressTag") or "").strip().lower() == "home"]
-    if len(home_matches) == 1:
-        address_id = home_matches[0].get("id")
-        if address_id:
-            store.set_default_address(jid, address_id)
-        return address_id
-
-    return None
+async def _ask_address(jid: str, user: UserState, addresses: list[dict[str, Any]], text: str) -> None:
+    ordered = _sort_home_first(addresses)[:WHATSAPP_ADDRESS_ROW_CAP]
+    user.pending_address_choice = PendingAddressChoice(candidates=ordered, original_text=text)
+    rows = [
+        (
+            f"addr:{a.get('id')}",
+            a.get("addressTag") or f"Address {i + 1}",
+            (a.get("addressLine") or "")[:72],
+        )
+        for i, a in enumerate(ordered)
+    ]
+    body = _greeting_prefix(user) + "Which address should this go to?"
+    await whatsapp.send_list(jid, body, "Choose address", rows)
 
 
-ADDRESS_PAGE_SIZE = 3
-
-
-def _sort_home_first(addresses: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return sorted(
-        addresses, key=lambda a: 0 if (a.get("addressTag") or "").strip().lower() == "home" else 1
-    )
-
-
-def _format_address_tag(index: int, address: dict[str, Any]) -> str:
-    # Tag only, not the full address line — keeps the one-time picker short.
-    tag = address.get("addressTag") or f"Address {index}"
-    return f"{index}️⃣ {tag}"
-
-
-def _address_prompt(candidates: list[dict[str, Any]], shown_count: int) -> str:
-    shown = candidates[:shown_count]
-    listing = "\n".join(_format_address_tag(i + 1, a) for i, a in enumerate(shown))
-    footer = 'Reply with the number'
-    if shown_count < len(candidates):
-        footer += ', or say "show more" for the rest'
-    footer += " — I'll remember it for next time, no need to pick again."
-    return f"Which address should I deliver to?\n\n{listing}\n\n{footer}"
-
-
-async def _start_new_order(jid: str, user: UserState, text: str) -> str:
+async def _start_new_order(jid: str, user: UserState, text: str) -> None:
     recent_names = [o.get("name", "") for o in user.order_history[-5:] if o.get("name")]
     intent = extract_intent(text, order_history=recent_names or None)
 
     addresses = await swiggy_client.get_addresses()
     if not addresses:
-        return "No saved address on your Swiggy account — add one before I can search."
+        await whatsapp.send_text(
+            jid, "No saved address on your Swiggy account — add one before I can search."
+        )
+        return
 
     address_id = _resolve_address(jid, user, addresses)
     if address_id is None:
-        ordered = _sort_home_first(addresses)
-        user.pending_address_choice = PendingAddressChoice(
-            candidates=ordered, original_text=text, shown_count=min(ADDRESS_PAGE_SIZE, len(ordered))
-        )
-        return _address_prompt(ordered, user.pending_address_choice.shown_count)
+        await _ask_address(jid, user, addresses, text)
+        return
 
     search = await swiggy_client.search_menu(
         address_id, intent.query, veg_only=(intent.dietary_preference == "veg")
@@ -127,24 +136,31 @@ async def _start_new_order(jid: str, user: UserState, text: str) -> str:
     candidates, was_relaxed = _filter_candidates(raw_candidates, intent.max_price)
 
     if len(candidates) < 2:
-        return f"Couldn't find enough matches for '{intent.query}' near you at all — try a different dish?"
+        await whatsapp.send_text(
+            jid, f"Couldn't find enough matches for '{intent.query}' near you — try a different dish?"
+        )
+        return
 
     try:
         safe_pick, mood_pick = rank.rank_candidates(intent, candidates)
     except rank.NoValidCandidatesError:
-        return "Had trouble picking between the options — try rephrasing your request?"
+        await whatsapp.send_text(jid, "Had trouble picking between the options — try rephrasing?")
+        return
 
     user.pending_options = PendingOptions(
         safe_pick=safe_pick, mood_pick=mood_pick, address_id=address_id
     )
-    header = "🍽️ Top 2 Picks Found:"
+    body = _greeting_prefix(user)
+    if intent.high_protein:
+        body += "High-protein picks:\n\n"
     if was_relaxed and intent.max_price is not None:
-        header += f"\n(nothing solid under ₹{intent.max_price}, showing closest matches)"
-    return (
-        f"{header}\n\n"
-        f"1️⃣ {_format_item('Safe Pick', safe_pick)}\n\n"
-        f"2️⃣ {_format_item('Mood Pick', mood_pick)}\n\n"
-        'Reply "1" or "2" to pick one — I\'ll confirm before ordering anything.'
+        body += f"(nothing solid under ₹{intent.max_price}, showing closest matches)\n\n"
+    body += f"Safe Pick: {_item_line(safe_pick)}\n\nMood Pick: {_item_line(mood_pick)}"
+    await whatsapp.send_reply_buttons(
+        jid,
+        body,
+        [("pick:safe", "Safe Pick"), ("pick:mood", "Mood Pick")],
+        footer="I'll confirm before ordering anything",
     )
 
 
@@ -174,11 +190,12 @@ async def _add_to_cart_and_revalidate(
 
 
 async def _poll_payment_and_finalize(
-    place_result: dict[str, Any], address_id: str
-) -> str:
+    jid: str, place_result: dict[str, Any], address_id: str
+) -> None:
     paas_id = place_result.get("paasId")
     if not paas_id:
-        return "Payment couldn't be started — try again in a moment?"
+        await whatsapp.send_text(jid, "Payment couldn't be started — try again in a moment?")
+        return
 
     interval_s = max(place_result.get("pollingIntervalInMs", 3000), 1000) / 1000
     max_time_s = place_result.get("maxTimeToPollForInMs", 120_000) / 1000
@@ -199,23 +216,26 @@ async def _poll_payment_and_finalize(
             continue
 
         if status.get("isTerminalSuccess"):
-            if status.get("confirmed"):
-                return "Payment confirmed — your order's in!"
-            order_id = status.get("orderId") or place_result.get("orderId")
-            lat, lng = place_result.get("lat"), place_result.get("lng")
-            if order_id and lat is not None and lng is not None:
-                await swiggy_client.confirm_order(
-                    order_id, address_id, lat, lng, cart_id=place_result.get("cartId")
-                )
-            return "Payment confirmed — your order's in!"
+            if not status.get("confirmed"):
+                order_id = status.get("orderId") or place_result.get("orderId")
+                lat, lng = place_result.get("lat"), place_result.get("lng")
+                if order_id and lat is not None and lng is not None:
+                    await swiggy_client.confirm_order(
+                        order_id, address_id, lat, lng, cart_id=place_result.get("cartId")
+                    )
+            await whatsapp.send_text(
+                jid, "Order placed! Track it in the Swiggy app — no more messages from me on this one."
+            )
+            return
 
         if status.get("isTerminalFailure"):
-            return "Payment didn't go through — want to try again?"
+            await whatsapp.send_text(jid, "Payment didn't go through — want to try again?")
+            return
 
-    return "Still waiting on payment confirmation — check the Swiggy app if this takes a while."
+    await whatsapp.send_text(jid, "Still waiting on payment — check the Swiggy app if this takes a while.")
 
 
-async def handle_message(jid: str, text: str) -> str:
+async def handle_message(jid: str, text: str, interactive_id: str | None = None) -> None:
     user = store.get(jid)
 
     # A pending checkout confirmation takes priority over everything else —
@@ -225,89 +245,119 @@ async def handle_message(jid: str, text: str) -> str:
         pending = user.pending_address_choice
         if pending.is_expired():
             user.pending_address_choice = None
-            return "That timed out — send your order again?"
+            await whatsapp.send_text(jid, "That timed out — send your order again?")
+            return
 
-        lowered = text.strip().lower()
-        wants_more = any(kw in lowered for kw in ("more", "other", "else", "none of"))
-        if wants_more and pending.shown_count < len(pending.candidates):
-            pending.shown_count = len(pending.candidates)
-            return _address_prompt(pending.candidates, pending.shown_count)
+        chosen_id: str | None = None
+        if interactive_id and interactive_id.startswith("addr:"):
+            chosen_id = interactive_id.split(":", 1)[1]
+        else:
+            choice_num = resolve_numbered_choice(text, len(pending.candidates))
+            if choice_num is not None:
+                chosen_id = pending.candidates[choice_num - 1].get("id")
 
-        choice_num = resolve_numbered_choice(text, pending.shown_count)
-        if choice_num is None:
-            return f'Not sure which one — reply with a number, 1-{pending.shown_count}.'
+        if chosen_id is None:
+            await whatsapp.send_text(jid, "Not sure which address — tap one from the list above.")
+            return
 
-        chosen_id = pending.candidates[choice_num - 1].get("id")
         original_text = pending.original_text
         user.pending_address_choice = None
-        if chosen_id:
-            store.set_default_address(jid, chosen_id)
-        return await _start_new_order(jid, user, original_text)
+        store.set_default_address(jid, chosen_id)
+        await _start_new_order(jid, user, original_text)
+        return
 
     if user.pending_confirmation is not None:
-        if user.pending_confirmation.is_expired():
+        pending_c = user.pending_confirmation
+        if pending_c.is_expired():
             user.pending_confirmation = None
-            return "That offer's gone stale — want me to search again?"
+            await whatsapp.send_text(jid, "That offer's gone stale — want me to search again?")
+            return
 
-        decision = resolve_confirmation(text)
+        if interactive_id == "confirm:yes":
+            decision = "yes"
+        elif interactive_id == "confirm:no":
+            decision = "no"
+        else:
+            decision = resolve_confirmation(text)
+
         if decision == "yes":
-            item = user.pending_confirmation.item
-            address_id = user.pending_confirmation.address_id
+            item = pending_c.item
+            address_id = pending_c.address_id
             user.pending_confirmation = None
 
             cart, error = await _add_to_cart_and_revalidate(item, address_id)
             if error:
-                return error
+                await whatsapp.send_text(jid, error)
+                return
 
             fresh_price = cart.get("pricing", {}).get("to_pay") if cart else None
-            # Default to Cash/COD, matching the "minimal phone-interaction"
-            # default from plan notes — UPI is a fallback, not built out here.
+            # Default to Cash/COD for now — payment method choice (UPI apps,
+            # COD) is the next increment, not built yet, see plan checklist.
             result = await swiggy_client.place_food_order(address_id, payment_method="Cash")
             user.order_history.append(item)
 
             if result.get("status") == "PENDING_PAYMENT" or result.get("normalizedStatus") == "pending":
-                return await _poll_payment_and_finalize(result, address_id)
+                await _poll_payment_and_finalize(jid, result, address_id)
+                return
 
             price_note = f" (₹{fresh_price})" if fresh_price else ""
-            return f"Confirmed! {item.get('name', 'Your order')}{price_note} is on its way."
+            await whatsapp.send_text(
+                jid,
+                f"Order placed! {item.get('name', 'Your order')}{price_note} is on its way. "
+                "Track it in the Swiggy app — no more messages from me on this one.",
+            )
         elif decision == "no":
             user.pending_confirmation = None
-            return "No worries, cancelled."
+            await whatsapp.send_text(jid, "No worries, cancelled.")
         else:
-            return 'Just need a yes or no to confirm — reply "yes" to place the order.'
+            await whatsapp.send_text(jid, "Just tap Yes or No to confirm.")
+        return
 
     if user.pending_options is not None and not user.pending_options.is_expired():
-        kind = classify_message(text, has_pending_options=True)
-        if kind == "new_order":
-            user.pending_options = None
-            return await _start_new_order(jid, user, text)
-        if kind == "selection":
+        pending_o = user.pending_options
+
+        if interactive_id in ("pick:safe", "pick:mood"):
+            choice = "safe" if interactive_id == "pick:safe" else "mood"
+        else:
+            kind = classify_message(text, has_pending_options=True)
+            if kind == "new_order":
+                user.pending_options = None
+                await _start_new_order(jid, user, text)
+                return
+            if kind == "cancellation":
+                user.pending_options = None
+                await whatsapp.send_text(jid, "No worries, cancelled.")
+                return
+            if kind == "modification":
+                # TODO: merge the modification into the existing search rather
+                # than discarding it — deliberately not built yet.
+                user.pending_options = None
+                await whatsapp.send_text(jid, "Got it — send your updated request and I'll search again.")
+                return
+            if kind != "selection":
+                await whatsapp.send_text(
+                    jid, "Not sure that's about food — still got two options waiting if you want them."
+                )
+                return
             choice = resolve_selection(text)
             if choice == "unclear":
-                return 'Not sure which one — reply "1" for Safe Pick or "2" for Mood Pick.'
-            item = (
-                user.pending_options.safe_pick
-                if choice == "safe"
-                else user.pending_options.mood_pick
-            )
-            address_id = user.pending_options.address_id
-            user.pending_options = None
-            user.pending_confirmation = PendingConfirmation(item=item, address_id=address_id)
-            return f"{_format_item('Confirm', item)}\n\nPlace this order? (yes/no)"
-        if kind == "cancellation":
-            user.pending_options = None
-            return "No worries, cancelled."
-        if kind == "modification":
-            # TODO: merge the modification into the existing search rather than
-            # discarding it — deliberately not built yet, see plan checklist.
-            user.pending_options = None
-            return "Got it — send your updated request and I'll search again."
-        return "Not sure that's about food — still got two options waiting if you want them."
+                await whatsapp.send_text(jid, "Not sure which one — tap Safe Pick or Mood Pick above.")
+                return
+
+        item = pending_o.safe_pick if choice == "safe" else pending_o.mood_pick
+        address_id = pending_o.address_id
+        user.pending_options = None
+        user.pending_confirmation = PendingConfirmation(item=item, address_id=address_id)
+        await whatsapp.send_reply_buttons(
+            jid, f"Confirm: {_item_line(item)}\n\nPlace this order?", [("confirm:yes", "Yes"), ("confirm:no", "No")]
+        )
+        return
 
     if user.pending_options is not None and user.pending_options.is_expired():
         user.pending_options = None
 
     kind = classify_message(text, has_pending_options=False)
     if kind == "not_food":
-        return "I only handle food orders here — tell me what you're craving."
-    return await _start_new_order(jid, user, text)
+        await whatsapp.send_text(jid, "I only handle food orders here — tell me what you're craving.")
+        return
+    await _start_new_order(jid, user, text)

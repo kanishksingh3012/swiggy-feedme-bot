@@ -42,7 +42,6 @@ class PendingAddressChoice:
 
     candidates: list[dict[str, Any]]
     original_text: str
-    shown_count: int = 3
     created_at: float = field(default_factory=time.time)
 
     def is_expired(self) -> bool:
@@ -56,6 +55,7 @@ class UserState:
     pending_address_choice: PendingAddressChoice | None = None
     order_history: list[dict[str, Any]] = field(default_factory=list)
     default_address_id: str | None = None
+    has_greeted: bool = False
 
 
 def _load_default_addresses() -> dict[str, str]:

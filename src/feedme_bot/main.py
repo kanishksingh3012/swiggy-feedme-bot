@@ -9,7 +9,6 @@ import logging
 
 from fastapi import FastAPI, Request, Response
 
-from feedme_bot import whatsapp
 from feedme_bot.config import settings
 from feedme_bot.handlers import handle_message
 
@@ -47,17 +46,33 @@ async def receive_webhook(request: Request) -> dict[str, str]:
             logger.info("Ignoring message from non-allowed number %s", from_number)
             continue
 
-        text = message.get("text", {}).get("body", "")
-        if not text:
-            continue  # voice notes / other types handled separately, not wired up yet
+        text = ""
+        interactive_id: str | None = None
+        msg_type = message.get("type")
 
-        reply = await handle_message(from_number, text)
+        if msg_type == "text":
+            text = message.get("text", {}).get("body", "")
+        elif msg_type == "interactive":
+            # Standard Cloud API shape for a tapped button/list row — logging
+            # the raw block on first use since the docs didn't give us the
+            # exact shape to verify against ahead of time (see plan notes).
+            interactive = message.get("interactive", {})
+            logger.info("Raw interactive payload: %s", interactive)
+            reply_obj = interactive.get("button_reply") or interactive.get("list_reply") or {}
+            interactive_id = reply_obj.get("id")
+            text = reply_obj.get("title", "")
+        else:
+            continue  # voice notes / other types not wired up yet
+
+        if not text and not interactive_id:
+            continue
+
         try:
-            await whatsapp.send_text(from_number, reply)
+            await handle_message(from_number, text, interactive_id=interactive_id)
         except Exception:
-            # A failed outbound send (e.g. an invalid/unreachable recipient)
-            # shouldn't crash the webhook handler — log it and move on. Meta
+            # A failed reply (bad outbound send, unhandled error mid-flow)
+            # shouldn't crash the webhook handler — log and move on. Meta
             # expects a fast 200 regardless, or it'll start retrying delivery.
-            logger.exception("Failed to send WhatsApp reply to %s", from_number)
+            logger.exception("Failed handling message from %s", from_number)
 
     return {"status": "ok"}
