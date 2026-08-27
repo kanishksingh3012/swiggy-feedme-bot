@@ -120,7 +120,9 @@ async def _ask_address(jid: str, user: UserState, addresses: list[dict[str, Any]
     await whatsapp.send_reply_buttons(jid, body, buttons)
 
 
-async def _start_new_order(jid: str, user: UserState, text: str) -> None:
+async def _start_new_order(
+    jid: str, user: UserState, text: str, resolved_address_id: str | None = None
+) -> None:
     recent_names = [o.get("name", "") for o in user.order_history[-5:] if o.get("name")]
     intent = extract_intent(text, order_history=recent_names or None)
 
@@ -131,7 +133,11 @@ async def _start_new_order(jid: str, user: UserState, text: str) -> None:
         )
         return
 
-    address_id = _resolve_address(jid, user, addresses)
+    # resolved_address_id is set when this call is a direct continuation
+    # right after the user just tapped an address — skips re-resolving
+    # (which would otherwise always ask again, since there's no remembered
+    # default to fall back on anymore, causing an infinite ask loop).
+    address_id = resolved_address_id or _resolve_address(jid, user, addresses)
     if address_id is None:
         await _ask_address(jid, user, addresses, text)
         return
@@ -330,7 +336,7 @@ async def handle_message(jid: str, text: str, interactive_id: str | None = None)
             # blank query.
             await whatsapp.send_text(jid, "Got it — using that address from now on.")
             return
-        await _start_new_order(jid, user, original_text)
+        await _start_new_order(jid, user, original_text, resolved_address_id=chosen_id)
         return
 
     if user.pending_confirmation is not None:
