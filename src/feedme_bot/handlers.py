@@ -30,6 +30,17 @@ from feedme_bot.state import (
     store,
 )
 
+def _swiggy_error_text(exc: swiggy_client.SwiggyToolError) -> str:
+    """SwiggyToolError carries the raw isError:true payload — pull the
+    human-readable text out of it rather than showing the user a raw dict."""
+    payload = exc.args[0] if exc.args else {}
+    content = payload.get("content", []) if isinstance(payload, dict) else []
+    for block in content:
+        if isinstance(block, dict) and block.get("text"):
+            return str(block["text"])
+    return "an unexpected error from Swiggy"
+
+
 # search_menu returns no ETA field at all (only search_restaurants would) — so
 # intent.max_eta_mins can't actually be honored by this item-search-based flow.
 # Not silently ignoring it: surfaced as a known gap here rather than faked.
@@ -366,13 +377,30 @@ async def handle_message(jid: str, text: str, interactive_id: str | None = None)
             fresh_price = cart.get("pricing", {}).get("to_pay") if cart else None
             # Default to Cash/COD for now — payment method choice (UPI apps,
             # COD) is the next increment, not built yet, see plan checklist.
-            result = await swiggy_client.place_food_order(address_id, payment_method="Cash")
-            user.order_history.append(item)
+            try:
+                result = await swiggy_client.place_food_order(address_id, payment_method="Cash")
+            except swiggy_client.SwiggyToolError as exc:
+                # Real live failure caught: this raised all the way up to
+                # main.py's catch-all before, which only logs - the user got
+                # total silence instead of a reason. Never let checkout fail
+                # without telling the user something.
+                reason = _swiggy_error_text(exc)
+                await whatsapp.send_text(
+                    jid, f"Couldn't place the order: {reason}. Nothing was charged."
+                )
+                return
+            except Exception:
+                await whatsapp.send_text(
+                    jid, "Something went wrong placing the order — nothing was charged. Try again?"
+                )
+                raise
 
             if result.get("status") == "PENDING_PAYMENT" or result.get("normalizedStatus") == "pending":
+                user.order_history.append(item)
                 await _poll_payment_and_finalize(jid, result, address_id)
                 return
 
+            user.order_history.append(item)
             price_note = f" (₹{fresh_price})" if fresh_price else ""
             await whatsapp.send_text(
                 jid,
